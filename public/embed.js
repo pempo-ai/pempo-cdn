@@ -1,98 +1,344 @@
 (function () {
-  // Utility: Format date to ISO with timestamp
+  const DEBUG = false;
+  const log = (...args) => DEBUG && console.log("[RAG-OPT]", ...args);
+
+  // RAG-specific chunking configuration
+  const CHUNK_CONFIG = {
+    targetTokens: 384,
+    overlapTokens: 64,
+    minChunkSize: 256,
+    maxChunkSize: 512
+  };
+
   function getISOTimestamp() {
     return new Date().toISOString();
   }
 
-  // Utility: Extract FAQs
-  function extractFAQSchema() {
+  function getArticleContainer() {
+    const selectors = [
+      '[data-rag-article]',
+      'main article',
+      '[role="main"] article',
+      '.entry-content',
+      '.post-content',
+      '.article-content',
+      '.content-body',
+      '[itemtype*="Article"]'
+    ];
+
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+
+    log("No specific container found. Falling back to <body>.");
+    return document.body;
+  }
+
+  // Estimate token count (rough approximation)
+  function estimateTokens(text) {
+    return Math.ceil(text.length / 4);
+  }
+
+  // Create semantic chunks optimized for RAG retrieval
+  function createSemanticChunks(content) {
+    const chunks = [];
+    const paragraphs = content.split(/\n\s*\n/);
+    let currentChunk = '';
+    let currentTokens = 0;
+
+    for (const paragraph of paragraphs) {
+      const paraTokens = estimateTokens(paragraph);
+      
+      if (currentTokens + paraTokens > CHUNK_CONFIG.targetTokens && currentChunk) {
+        // Add chunk with citation metadata
+        chunks.push({
+          text: currentChunk.trim(),
+          tokens: currentTokens,
+          chunkId: `chunk_${chunks.length}`,
+          entities: extractEntities(currentChunk),
+          claims: extractClaims(currentChunk),
+          citationReady: true
+        });
+
+        // Start new chunk with overlap
+        const sentences = currentChunk.split(/[.!?]+/).filter(s => s.trim());
+        const overlapSentences = sentences.slice(-2); // Last 2 sentences for context
+        currentChunk = overlapSentences.join('. ') + '. ' + paragraph;
+        currentTokens = estimateTokens(currentChunk);
+      } else {
+        currentChunk += (currentChunk ? '\n\n' : '') + paragraph;
+        currentTokens += paraTokens;
+      }
+    }
+
+    // Add final chunk
+    if (currentChunk.trim()) {
+      chunks.push({
+        text: currentChunk.trim(),
+        tokens: currentTokens,
+        chunkId: `chunk_${chunks.length}`,
+        entities: extractEntities(currentChunk),
+        claims: extractClaims(currentChunk),
+        citationReady: true
+      });
+    }
+
+    return chunks;
+  }
+
+  // Extract entities for better LLM understanding
+  function extractEntities(text) {
+    const entities = [];
+    
+    // Extract numbers and percentages (key for citations)
+    const numberPattern = /\b\d{1,3}(?:,\d{3})*(?:\.\d+)?%?\b/g;
+    const numbers = text.match(numberPattern) || [];
+    numbers.forEach(num => {
+      entities.push({ text: num, type: 'NUMBER' });
+    });
+
+    // Extract potential organizations (capitalized words)
+    const orgPattern = /\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g;
+    const orgs = text.match(orgPattern) || [];
+    orgs.forEach(org => {
+      if (org.length > 3 && !['The', 'This', 'That', 'With', 'When', 'Where'].includes(org)) {
+        entities.push({ text: org, type: 'ORGANIZATION' });
+      }
+    });
+
+    return entities;
+  }
+
+  // Extract factual claims that LLMs can cite
+  function extractClaims(text) {
+    const claims = [];
+    const sentences = text.split(/[.!?]+/).filter(s => s.trim());
+
+    sentences.forEach(sentence => {
+      const trimmed = sentence.trim();
+      if (trimmed.length > 20) {
+        // Look for claim indicators
+        const claimIndicators = [
+          /according to/i,
+          /research shows/i,
+          /studies indicate/i,
+          /data reveals/i,
+          /\d+%/,
+          /increased by/i,
+          /decreased by/i
+        ];
+
+        const isFactualClaim = claimIndicators.some(pattern => pattern.test(trimmed));
+        
+        if (isFactualClaim) {
+          claims.push({
+            text: trimmed,
+            type: 'FACTUAL_CLAIM',
+            citationReady: true
+          });
+        }
+      }
+    });
+
+    return claims;
+  }
+
+  function isQuestionLike(text) {
+    const questionWords = /^(how|what|when|where|why|which|who|can|does|is|are|will|would|should)/i;
+    const hasQuestionMark = text.includes("?");
+    return questionWords.test(text) || hasQuestionMark;
+  }
+
+  function shouldSkip(text) {
+    const skipPhrases = [
+      "Ask, Click, Manifest.",
+      "Need an Answer—Fast?"
+    ];
+
+    const skipPatterns = [
+      /^(share|subscribe|follow|comment)/i,
+      /^(advertisement|sponsored|promoted)/i,
+      /^(related|similar|more)/i,
+      /^(newsletter|signup|join|shop)/i,
+      /^(\s*next|previous)\s*/i
+    ];
+
+    return (
+      skipPhrases.includes(text) ||
+      skipPatterns.some((pattern) => pattern.test(text))
+    );
+  }
+
+  function extractFAQSchema(container) {
     const faqs = [];
-    const headings = document.querySelectorAll("h2, h3");
+    const headings = container.querySelectorAll("h2, h3");
 
     headings.forEach((heading) => {
       const question = heading.textContent.trim();
-      const next = heading.nextElementSibling;
-      if (next && next.tagName.toLowerCase() === "p") {
-        const answer = next.textContent.trim();
-        faqs.push({
-          "@type": "Question",
-          "name": question,
-          "acceptedAnswer": {
-            "@type": "Answer",
-            "text": answer,
-          },
-        });
+      if (!isQuestionLike(question) || shouldSkip(question)) return;
+
+      let answer = "";
+      let sibling = heading.nextElementSibling;
+      let count = 0;
+
+      while (sibling && count < 3) {
+        if (sibling.tagName.match(/^H[1-6]$/)) break;
+        if (sibling.tagName.toLowerCase() === "p") {
+          answer += sibling.textContent.trim() + " ";
+        }
+        sibling = sibling.nextElementSibling;
+        count++;
       }
+
+      answer = answer.trim();
+      if (answer.length < 30) return;
+
+      faqs.push({
+        "@type": "Question",
+        name: question,
+        acceptedAnswer: {
+          "@type": "Answer",
+          text: answer,
+          // Add citation metadata for LLMs
+          citation: {
+            url: window.location.href,
+            title: document.title,
+            author: extractAuthor(),
+            datePublished: extractPublishDate()
+          }
+        }
+      });
     });
 
     return faqs.length > 0 ? faqs : null;
   }
 
-  // Utility: Extract page summary
-  function extractSummary() {
-    const paragraphs = Array.from(document.querySelectorAll("p"));
-    const firstThree = paragraphs.slice(0, 3).map((p) => p.textContent.trim());
-    return firstThree.join(" ").substring(0, 500);
+  function extractAuthor() {
+    const authorMeta = document.querySelector('meta[name="author"]');
+    return authorMeta ? authorMeta.getAttribute('content') : 'Unknown Author';
   }
 
-  // Utility: Inject structured data
+  function extractPublishDate() {
+    const dateMeta = document.querySelector('meta[property="article:published_time"]') ||
+                    document.querySelector('meta[name="publish_date"]');
+    return dateMeta ? dateMeta.getAttribute('content') : new Date().toISOString();
+  }
+
+  function extractPageContent() {
+    const container = getArticleContainer();
+    
+    // Extract text content, preserving paragraph structure
+    const textContent = Array.from(container.querySelectorAll('p, h1, h2, h3, h4, h5, h6'))
+      .map(el => el.textContent.trim())
+      .filter(text => text.length > 20)
+      .join('\n\n');
+
+    return textContent;
+  }
+
+  function extractSummary(container) {
+    const paragraphs = Array.from(container.querySelectorAll("p"));
+    const firstThree = paragraphs.slice(0, 3).map((p) => p.textContent.trim());
+    return firstThree.join(" ").substring(0, 300);
+  }
+
+  function schemaAlreadyExists(type) {
+    const existing = Array.from(
+      document.querySelectorAll('script[type="application/ld+json"]')
+    );
+    return existing.some((el) => el.textContent.includes(`"${type}"`));
+  }
+
   function injectJSONLDSchema(schemaObj) {
     const scriptTag = document.createElement("script");
     scriptTag.type = "application/ld+json";
     scriptTag.textContent = JSON.stringify(schemaObj, null, 2);
     document.head.appendChild(scriptTag);
+    log(`Injected ${schemaObj["@type"]} schema.`);
   }
 
-  // Main Runner
-  function runPEMPOEmbed() {
-    const timestamp = getISOTimestamp();
+  // Main optimization function
+  function runRAGOptimization() {
+    const container = getArticleContainer();
     const url = window.location.href;
     const title = document.title;
-    const summary = extractSummary();
-    const faqs = extractFAQSchema();
+    const summary = extractSummary(container);
+    const faqs = extractFAQSchema(container);
+    const timestamp = getISOTimestamp();
+    
+    // Extract and chunk content for RAG
+    const content = extractPageContent();
+    const chunks = createSemanticChunks(content);
+    
+    // Enhanced Article schema with RAG optimization
+    if (!schemaAlreadyExists("Article")) {
+      const articleSchema = {
+        "@context": "https://schema.org",
+        "@type": "Article",
+        headline: title,
+        description: summary,
+        dateModified: timestamp,
+        datePublished: extractPublishDate(),
+        mainEntityOfPage: url,
+        author: {
+          "@type": "Person",
+          "name": extractAuthor()
+        },
+        // RAG-specific enhancements
+        "semanticChunks": chunks.map(chunk => ({
+          "@type": "TextDigitalDocument",
+          "identifier": chunk.chunkId,
+          "text": chunk.text,
+          "wordCount": chunk.tokens,
+          "about": chunk.entities.map(e => e.text),
+          "citation": {
+            "url": url,
+            "title": title,
+            "chunkId": chunk.chunkId
+          }
+        })),
+        "keyEntities": chunks.flatMap(chunk => chunk.entities),
+        "factualClaims": chunks.flatMap(chunk => chunk.claims),
+        "citationReadiness": Math.round((chunks.filter(c => c.citationReady).length / chunks.length) * 100)
+      };
+      
+      injectJSONLDSchema(articleSchema);
+    }
 
-    // Article schema
-    const articleSchema = {
-      "@context": "https://schema.org",
-      "@type": "Article",
-      "headline": title,
-      "dateModified": timestamp,
-      "mainEntityOfPage": url,
-      "description": summary,
-    };
-    injectJSONLDSchema(articleSchema);
-
-    // FAQ schema
-    if (faqs) {
+    // Enhanced FAQ schema with citation data
+    if (faqs && !schemaAlreadyExists("FAQPage")) {
       const faqSchema = {
         "@context": "https://schema.org",
         "@type": "FAQPage",
-        "mainEntity": faqs,
+        "mainEntity": faqs
       };
       injectJSONLDSchema(faqSchema);
     }
-        // RAG-friendly metadata for LLMs
-  const ragChunks = {
-    "@pempo": {
-      url: url,
-      title: title,
-      summary: summary,
-      timestamp: timestamp,
-     headings: Array.from(
-  (document.querySelector("article") || document.querySelector("main") || document.body)
-  .querySelectorAll("h2, h3")
-).map(h => h.textContent.trim()),
-      faqQuestions: faqs ? faqs.map(f => f.name) : [],
+
+    // Add ClaimReview schema for factual claims
+    const allClaims = chunks.flatMap(chunk => chunk.claims);
+    if (allClaims.length > 0 && !schemaAlreadyExists("ClaimReview")) {
+      const claimSchema = {
+        "@context": "https://schema.org",
+        "@type": "ClaimReview",
+        "claimReviewed": allClaims.slice(0, 5).map(claim => ({
+          "@type": "Claim",
+          "text": claim.text,
+          "author": extractAuthor(),
+          "datePublished": extractPublishDate()
+        }))
+      };
+      injectJSONLDSchema(claimSchema);
     }
-  };
-  window.__PEMPO_RAG__ = ragChunks;
-  console.log("[PEMPO] Injected schema and RAG metadata:", ragChunks);
+
+    log(`RAG optimization complete: ${chunks.length} chunks, ${allClaims.length} claims`);
   }
 
-  // Trigger when ready
+  // Run optimization
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", runPEMPOEmbed);
+    document.addEventListener("DOMContentLoaded", runRAGOptimization);
   } else {
-    runPEMPOEmbed();
+    runRAGOptimization();
   }
 })();
