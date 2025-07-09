@@ -1,5 +1,5 @@
 (function () {
-  const DEBUG = false;
+  const DEBUG = true; // Enable debugging to see what's happening
   const log = (...args) => DEBUG && console.log("[RAG-OPT]", ...args);
 
   // RAG-specific chunking configuration
@@ -23,12 +23,32 @@
       '.post-content',
       '.article-content',
       '.content-body',
-      '[itemtype*="Article"]'
+      '[itemtype*="Article"]',
+      'article',
+      'main',
+      '[role="main"]'
     ];
 
     for (const sel of selectors) {
       const el = document.querySelector(sel);
-      if (el) return el;
+      if (el && el.textContent.trim().length > 500) {
+        log(`Found article container using selector: ${sel}`);
+        return el;
+      }
+    }
+
+    // More aggressive fallback - find the largest text container
+    const candidates = Array.from(document.querySelectorAll('div')).filter(div => {
+      const text = div.textContent.trim();
+      return text.length > 500 && div.querySelectorAll('p').length > 3;
+    });
+
+    if (candidates.length > 0) {
+      const largest = candidates.reduce((prev, current) => 
+        prev.textContent.length > current.textContent.length ? prev : current
+      );
+      log(`Found article container via largest text div: ${largest.className || largest.id || 'unnamed'}`);
+      return largest;
     }
 
     log("No specific container found. Falling back to <body>.");
@@ -42,10 +62,17 @@
 
   // Create semantic chunks optimized for RAG retrieval
   function createSemanticChunks(content) {
+    if (!content || content.length < 100) {
+      log("Content too short for chunking");
+      return [];
+    }
+
     const chunks = [];
-    const paragraphs = content.split(/\n\s*\n/);
+    const paragraphs = content.split(/\n\s*\n/).filter(p => p.trim().length > 50);
     let currentChunk = '';
     let currentTokens = 0;
+
+    log(`Processing ${paragraphs.length} paragraphs for chunking`);
 
     for (const paragraph of paragraphs) {
       const paraTokens = estimateTokens(paragraph);
@@ -84,6 +111,7 @@
       });
     }
 
+    log(`Created ${chunks.length} semantic chunks`);
     return chunks;
   }
 
@@ -102,7 +130,7 @@
     const orgPattern = /\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g;
     const orgs = text.match(orgPattern) || [];
     orgs.forEach(org => {
-      if (org.length > 3 && !['The', 'This', 'That', 'With', 'When', 'Where'].includes(org)) {
+      if (org.length > 3 && !['The', 'This', 'That', 'With', 'When', 'Where', 'What', 'How', 'Why'].includes(org)) {
         entities.push({ text: org, type: 'ORGANIZATION' });
       }
     });
@@ -126,7 +154,9 @@
           /data reveals/i,
           /\d+%/,
           /increased by/i,
-          /decreased by/i
+          /decreased by/i,
+          /found that/i,
+          /reported that/i
         ];
 
         const isFactualClaim = claimIndicators.some(pattern => pattern.test(trimmed));
@@ -172,7 +202,9 @@
 
   function extractFAQSchema(container) {
     const faqs = [];
-    const headings = container.querySelectorAll("h2, h3");
+    const headings = container.querySelectorAll("h2, h3, h4");
+
+    log(`Found ${headings.length} headings to check for FAQ content`);
 
     headings.forEach((heading) => {
       const question = heading.textContent.trim();
@@ -211,29 +243,45 @@
       });
     });
 
+    log(`Extracted ${faqs.length} FAQ items`);
     return faqs.length > 0 ? faqs : null;
   }
 
   function extractAuthor() {
-    const authorMeta = document.querySelector('meta[name="author"]');
-    return authorMeta ? authorMeta.getAttribute('content') : 'Unknown Author';
+    const authorMeta = document.querySelector('meta[name="author"]') ||
+                      document.querySelector('meta[property="article:author"]') ||
+                      document.querySelector('[rel="author"]');
+    
+    if (authorMeta) {
+      return authorMeta.getAttribute('content') || authorMeta.textContent || 'Unknown Author';
+    }
+    
+    return 'Unknown Author';
   }
 
   function extractPublishDate() {
     const dateMeta = document.querySelector('meta[property="article:published_time"]') ||
-                    document.querySelector('meta[name="publish_date"]');
-    return dateMeta ? dateMeta.getAttribute('content') : new Date().toISOString();
+                    document.querySelector('meta[name="publish_date"]') ||
+                    document.querySelector('meta[name="date"]') ||
+                    document.querySelector('time[datetime]');
+    
+    if (dateMeta) {
+      return dateMeta.getAttribute('content') || dateMeta.getAttribute('datetime') || new Date().toISOString();
+    }
+    
+    return new Date().toISOString();
   }
 
   function extractPageContent() {
     const container = getArticleContainer();
     
     // Extract text content, preserving paragraph structure
-    const textContent = Array.from(container.querySelectorAll('p, h1, h2, h3, h4, h5, h6'))
+    const textContent = Array.from(container.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li'))
       .map(el => el.textContent.trim())
-      .filter(text => text.length > 20)
+      .filter(text => text.length > 20 && !shouldSkip(text))
       .join('\n\n');
 
+    log(`Extracted ${textContent.length} characters of content`);
     return textContent;
   }
 
@@ -254,12 +302,23 @@
     const scriptTag = document.createElement("script");
     scriptTag.type = "application/ld+json";
     scriptTag.textContent = JSON.stringify(schemaObj, null, 2);
+    scriptTag.setAttribute('data-rag-injected', 'true');
     document.head.appendChild(scriptTag);
-    log(`Injected ${schemaObj["@type"]} schema.`);
+    log(`✓ Injected ${schemaObj["@type"]} schema into <head>`);
+    
+    // Verify injection worked
+    const injectedScript = document.querySelector('script[data-rag-injected="true"]');
+    if (injectedScript) {
+      log(`✓ Schema injection verified in DOM`);
+    } else {
+      log(`✗ Schema injection failed`);
+    }
   }
 
-  // Main optimization function
+  // Main optimization function - exposed globally
   function runRAGOptimization() {
+    log("🚀 Starting RAG optimization...");
+    
     const container = getArticleContainer();
     const url = window.location.href;
     const title = document.title;
@@ -269,6 +328,11 @@
     
     // Extract and chunk content for RAG
     const content = extractPageContent();
+    if (!content || content.length < 100) {
+      log("⚠️ Insufficient content found for RAG optimization");
+      return false;
+    }
+    
     const chunks = createSemanticChunks(content);
     
     // Enhanced Article schema with RAG optimization
@@ -332,13 +396,38 @@
       injectJSONLDSchema(claimSchema);
     }
 
-    log(`RAG optimization complete: ${chunks.length} chunks, ${allClaims.length} claims`);
+    log(`✅ RAG optimization complete:`);
+    log(`   - ${chunks.length} semantic chunks created`);
+    log(`   - ${allClaims.length} factual claims identified`);
+    log(`   - ${faqs ? faqs.length : 0} FAQ items processed`);
+    log(`   - Content length: ${content.length} characters`);
+    
+    return {
+      chunks: chunks.length,
+      claims: allClaims.length,
+      faqs: faqs ? faqs.length : 0,
+      contentLength: content.length
+    };
   }
 
-  // Run optimization
+  // Expose function globally for console access
+  window.runRAGOptimization = runRAGOptimization;
+  
+  // Also expose individual functions for debugging
+  window.ragDebug = {
+    getArticleContainer,
+    extractPageContent,
+    createSemanticChunks,
+    extractFAQSchema,
+    log
+  };
+
+  // Run optimization when DOM is ready
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", runRAGOptimization);
   } else {
     runRAGOptimization();
   }
+
+  log("RAG optimization script loaded and ready");
 })();
