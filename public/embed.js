@@ -78,7 +78,10 @@
       title: title,
       summary: summary,
       timestamp: timestamp,
-      headings: Array.from(document.querySelectorAll("h2, h3")).map(h => h.textContent.trim()),
+     headings: Array.from(
+  (document.querySelector("article") || document.querySelector("main") || document.body)
+  .querySelectorAll("h2, h3")
+).map(h => h.textContent.trim()),
       faqQuestions: faqs ? faqs.map(f => f.name) : [],
     }
   };
