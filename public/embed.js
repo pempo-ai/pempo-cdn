@@ -228,37 +228,158 @@
     return firstThree.join(" ").substring(0, 500);
   }
   
-  // Utility: Check if schema already exists
+  // Utility: Check if schema already exists (FIXED)
   function schemaAlreadyExists(type) {
     const scripts = document.querySelectorAll('script[type="application/ld+json"]');
     return Array.from(scripts).some(script => {
       try {
-        const json = JSON.parse(script.textContent);
-        return json["@type"] === type || (Array.isArray(json["@type"]) && json["@type"].includes(type));
+        const content = script.textContent || script.innerHTML;
+        if (!content) return false;
+        
+        const json = JSON.parse(content);
+        
+        // Handle both single objects and arrays
+        if (Array.isArray(json)) {
+          return json.some(item => 
+            item["@type"] === type || 
+            (Array.isArray(item["@type"]) && item["@type"].includes(type))
+          );
+        }
+        
+        return json["@type"] === type || 
+               (Array.isArray(json["@type"]) && json["@type"].includes(type));
       } catch (e) {
+        log(`Error parsing existing schema: ${e.message}`);
         return false;
       }
     });
   }
   
-  // Utility: Inject structured data
+  // Utility: Inject structured data (COMPLETELY REWRITTEN)
   function injectJSONLDSchema(schemaObj) {
     const type = schemaObj["@type"];
+    
+    // Check for duplicates
     if (schemaAlreadyExists(type)) {
-      log(`Skipped injecting duplicate ${type} schema`);
-      return;
+      log(`❌ Skipped injecting duplicate ${type} schema`);
+      return false;
     }
-    const scriptTag = document.createElement("script");
-    scriptTag.type = "application/ld+json";
-    scriptTag.textContent = JSON.stringify(schemaObj, null, 2);
-    scriptTag.setAttribute('data-rag-injected', 'true');
-    document.head.appendChild(scriptTag);
-    log(`✅ Injected ${type} schema`);
+    
+    try {
+      // Create script element
+      const scriptTag = document.createElement("script");
+      scriptTag.type = "application/ld+json";
+      scriptTag.setAttribute('data-rag-injected', 'true');
+      scriptTag.setAttribute('data-schema-type', type);
+      scriptTag.setAttribute('data-timestamp', getISOTimestamp());
+      
+      // Set content - use textContent for better compatibility
+      const jsonString = JSON.stringify(schemaObj, null, 2);
+      scriptTag.textContent = jsonString;
+      
+      // Wait for DOM to be ready and inject
+      const performInjection = () => {
+        let injected = false;
+        
+        // Strategy 1: Try to inject at end of body (preferred for additional schemas)
+        if (document.body) {
+          try {
+            document.body.appendChild(scriptTag);
+            injected = true;
+            log(`✅ Injected ${type} schema into end of <body>`);
+          } catch (e) {
+            log(`❌ Failed to inject into body: ${e.message}`);
+          }
+        }
+        
+        // Strategy 2: Fallback to head if body injection failed
+        if (!injected && document.head) {
+          try {
+            document.head.appendChild(scriptTag);
+            injected = true;
+            log(`✅ Injected ${type} schema into <head> (fallback)`);
+          } catch (e) {
+            log(`❌ Failed to inject into head: ${e.message}`);
+          }
+        }
+        
+        // Strategy 3: Last resort - inject before closing body tag
+        if (!injected) {
+          try {
+            document.documentElement.appendChild(scriptTag);
+            injected = true;
+            log(`✅ Injected ${type} schema into <html> (last resort)`);
+          } catch (e) {
+            log(`❌ All injection strategies failed: ${e.message}`);
+          }
+        }
+        
+        // Verify injection succeeded
+        if (injected) {
+          // Use a small delay to ensure DOM update
+          setTimeout(() => {
+            const verification = document.querySelector(`script[data-schema-type="${type}"]`);
+            if (verification) {
+              log(`✅ Schema injection verified: ${type}`);
+              log(`   Content length: ${verification.textContent.length} characters`);
+              
+              // Additional verification: try to parse the injected JSON
+              try {
+                const parsedContent = JSON.parse(verification.textContent);
+                log(`   JSON parsing successful: ${parsedContent["@type"]}`);
+              } catch (parseError) {
+                log(`❌ Injected JSON is invalid: ${parseError.message}`);
+              }
+            } else {
+              log(`❌ Schema injection verification failed: ${type}`);
+            }
+          }, 100);
+        }
+        
+        return injected;
+      };
+      
+      // Ensure DOM is ready before injection
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', performInjection);
+      } else {
+        return performInjection();
+      }
+      
+      return true;
+      
+    } catch (error) {
+      log(`❌ Error creating ${type} schema: ${error.message}`);
+      return false;
+    }
+  }
+  
+  // Debug function to list all JSON-LD on page
+  function debugExistingSchemas() {
+    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+    log(`📊 Found ${scripts.length} existing JSON-LD scripts on page:`);
+    
+    scripts.forEach((script, index) => {
+      try {
+        const content = script.textContent || script.innerHTML;
+        if (content) {
+          const json = JSON.parse(content);
+          const type = json["@type"] || 'Unknown';
+          const isRagInjected = script.getAttribute('data-rag-injected') === 'true';
+          log(`   ${index + 1}. Type: ${type} ${isRagInjected ? '(RAG-injected)' : '(existing)'}`);
+        }
+      } catch (e) {
+        log(`   ${index + 1}. Invalid JSON-LD (parse error)`);
+      }
+    });
   }
   
   // Main Runner
   function runRAGOptimization() {
     log("🚀 RAG optimization starting...");
+    
+    // Debug existing schemas first
+    debugExistingSchemas();
     
     const timestamp = getISOTimestamp();
     const url = window.location.href;
@@ -269,6 +390,8 @@
     // Extract and chunk content for RAG
     const content = extractPageContent();
     const chunks = createSemanticChunks(content);
+    
+    let injectionResults = { success: 0, failed: 0 };
     
     // Enhanced Article schema with RAG features
     const articleSchema = {
@@ -300,16 +423,25 @@
       "citationReadiness": chunks.length > 0 ? Math.round((chunks.filter(c => c.citationReady).length / chunks.length) * 100) : 0
     };
     
-    injectJSONLDSchema(articleSchema);
+    if (injectJSONLDSchema(articleSchema)) {
+      injectionResults.success++;
+    } else {
+      injectionResults.failed++;
+    }
     
     // Enhanced FAQ schema
-    if (faqs) {
+    if (faqs && faqs.length > 0) {
       const faqSchema = {
         "@context": "https://schema.org",
         "@type": "FAQPage",
         "mainEntity": faqs,
       };
-      injectJSONLDSchema(faqSchema);
+      
+      if (injectJSONLDSchema(faqSchema)) {
+        injectionResults.success++;
+      } else {
+        injectionResults.failed++;
+      }
     }
     
     // ClaimReview schema for factual claims
@@ -325,28 +457,45 @@
           "datePublished": timestamp
         }))
       };
-      injectJSONLDSchema(claimSchema);
+      
+      if (injectJSONLDSchema(claimSchema)) {
+        injectionResults.success++;
+      } else {
+        injectionResults.failed++;
+      }
     }
     
+    // Final summary
     log(`✅ RAG optimization complete:`);
-    log(`   - ${chunks.length} semantic chunks`);
-    log(`   - ${allClaims.length} factual claims`);
-    log(`   - ${faqs ? faqs.length : 0} FAQ items`);
+    log(`   - ${chunks.length} semantic chunks created`);
+    log(`   - ${allClaims.length} factual claims extracted`);
+    log(`   - ${faqs ? faqs.length : 0} FAQ items found`);
+    log(`   - ${injectionResults.success} schemas injected successfully`);
+    log(`   - ${injectionResults.failed} schema injections failed`);
+    
+    // Debug schemas again to show what was added
+    setTimeout(() => {
+      log("📊 Final schema status:");
+      debugExistingSchemas();
+    }, 500);
     
     return {
       chunks: chunks.length,
       claims: allClaims.length,
-      faqs: faqs ? faqs.length : 0
+      faqs: faqs ? faqs.length : 0,
+      injectionResults
     };
   }
   
   // Expose globally for testing
   window.runRAGOptimization = runRAGOptimization;
+  window.debugExistingSchemas = debugExistingSchemas;
   
-  // Trigger when ready
+  // Trigger when ready with better timing
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", runRAGOptimization);
   } else {
-    runRAGOptimization();
+    // Add small delay to ensure page is fully rendered
+    setTimeout(runRAGOptimization, 100);
   }
 })();
